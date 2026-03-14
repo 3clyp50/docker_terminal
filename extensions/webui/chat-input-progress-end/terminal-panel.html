@@ -1,0 +1,281 @@
+<html>
+<head>
+    <script type="module">
+        import { store } from "/plugins/docker_terminal/webui/terminal-store.js";
+    </script>
+</head>
+<body>
+    <div class="dtp-mount" x-data x-move-after="#progress-bar-box">
+        <template x-if="$store.dockerTerminal && $store.dockerTerminal.panelOpen">
+            <div class="dtp-panel"
+                 :style="$store.dockerTerminal.getPanelStyle()"
+                 x-destroy="$store.dockerTerminal.cleanup()">
+                <div class="dtp-resize-handle"
+                     @mousedown="$store.dockerTerminal.startResize($event)"
+                     title="Drag to resize terminal panel"></div>
+
+                <div class="dtp-tabs">
+                    <template x-for="session in $store.dockerTerminal.sessions" :key="session.id">
+                        <div class="dtp-tab"
+                             :class="{ 'active': $store.dockerTerminal.activeSessionId === session.id }"
+                             @click="$store.dockerTerminal.switchSession(session.id)">
+                            <span class="dtp-tab-icon">▶</span>
+                            <span class="dtp-tab-name" x-text="session.name"></span>
+                            <button class="dtp-tab-close"
+                                    @click.stop="$store.dockerTerminal.closeSession(session.id)"
+                                    title="Close session">×</button>
+                        </div>
+                    </template>
+
+                    <button class="dtp-tab dtp-tab-new"
+                            @click="$store.dockerTerminal.createSession()"
+                            title="New session">
+                        <span class="material-symbols-outlined">add</span>
+                    </button>
+
+                    <button class="dtp-tab dtp-tab-collapse"
+                            @click="$store.dockerTerminal.togglePanel()"
+                            title="Hide terminal panel">
+                        <span class="material-symbols-outlined">keyboard_arrow_down</span>
+                    </button>
+                </div>
+
+                <div x-show="$store.dockerTerminal.loading && $store.dockerTerminal.sessions.length === 0"
+                     class="dtp-loading">
+                    <div class="dtp-spinner"></div>
+                    <p>Connecting to terminal...</p>
+                </div>
+
+                <div x-show="!$store.dockerTerminal.loading || $store.dockerTerminal.sessions.length > 0"
+                     class="dtp-container"
+                     @keydown.escape.stop>
+                    <template x-for="session in $store.dockerTerminal.sessions" :key="session.id">
+                        <div :id="`terminal-${session.id}`"
+                             class="dtp-instance"
+                             x-show="$store.dockerTerminal.activeSessionId === session.id"></div>
+                    </template>
+                </div>
+            </div>
+        </template>
+    </div>
+
+    <style>
+        .dtp-mount {
+            width: 100%;
+        }
+
+        .dtp-panel {
+            --dt-terminal-bg: #0d1117;
+            display: flex;
+            flex-direction: column;
+            width: 100%;
+            min-height: 200px;
+            max-height: 60vh;
+            border-top: 1px solid var(--color-border);
+            background: var(--dt-terminal-bg);
+            overflow: hidden;
+        }
+
+        .dtp-resize-handle {
+            height: 0.5rem;
+            cursor: ns-resize;
+            border-bottom: 1px solid var(--color-border);
+            background-image: linear-gradient(rgba(255, 255, 255, 0.22), rgba(255, 255, 255, 0.22)), linear-gradient(rgba(255, 255, 255, 0.22), rgba(255, 255, 255, 0.22));
+            background-repeat: no-repeat;
+            background-size: 2rem 1px, 2rem 1px;
+            background-position: center calc(50% - 1px), center calc(50% + 1px);
+        }
+
+        .dtp-tabs {
+            display: flex;
+            gap: 4px;
+            background: var(--color-background-secondary);
+            padding: var(--spacing-xs) var(--spacing-sm);
+            border-bottom: 1px solid var(--color-border);
+            overflow-x: auto;
+            flex-shrink: 0;
+        }
+
+        .dtp-tab {
+            display: flex;
+            align-items: center;
+            gap: var(--spacing-xs);
+            padding: var(--spacing-xs) var(--spacing-sm);
+            background: var(--color-background);
+            color: var(--color-secondary);
+            border: 1px solid var(--color-border);
+            border-radius: 4px 4px 0 0;
+            cursor: pointer;
+            white-space: nowrap;
+            min-width: 110px;
+            font-size: 0.85rem;
+            transition: background 0.2s;
+        }
+
+        .dtp-tab:hover {
+            background: var(--color-background-hover);
+        }
+
+        .dtp-tab.active {
+            background: var(--dt-terminal-bg);
+            border-bottom-color: var(--dt-terminal-bg);
+            color: var(--color-primary);
+        }
+
+        .dtp-tab.active .dtp-tab-name {
+            color: var(--color-text);
+        }
+
+        .dtp-tab-new,
+        .dtp-tab-collapse {
+            min-width: auto;
+            padding: var(--spacing-xs);
+            justify-content: center;
+        }
+
+        .dtp-tab-new .material-symbols-outlined,
+        .dtp-tab-collapse .material-symbols-outlined {
+            font-size: 18px;
+        }
+
+        .dtp-tab-collapse {
+            margin-left: auto;
+        }
+
+        .dtp-tab-icon {
+            color: var(--color-accent);
+            font-size: 10px;
+        }
+
+        .dtp-tab-name {
+            flex: 1;
+        }
+
+        .dtp-tab-close {
+            background: none;
+            border: none;
+            color: var(--color-text-secondary);
+            cursor: pointer;
+            font-size: 18px;
+            line-height: 1;
+            padding: 0;
+            width: 18px;
+            height: 18px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 3px;
+            transition: all 0.2s;
+        }
+
+        .dtp-tab-close:hover {
+            background: rgba(224, 108, 117, 0.2);
+            color: #e06c75;
+        }
+
+        .dtp-loading {
+            display: flex;
+            flex: 1;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: var(--spacing-xl);
+            gap: var(--spacing-md);
+            text-align: center;
+            color: var(--color-text-secondary);
+            background: var(--dt-terminal-bg);
+        }
+
+        .dtp-spinner {
+            width: 36px;
+            height: 36px;
+            border: 3px solid var(--color-border);
+            border-top-color: var(--color-primary);
+            border-radius: 50%;
+            animation: dtp-spin 1s linear infinite;
+        }
+
+        @keyframes dtp-spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
+        .dtp-container {
+            background: var(--dt-terminal-bg);
+            flex: 1;
+            min-height: 140px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .dtp-instance {
+            width: 100%;
+            height: 100%;
+            padding: var(--spacing-xs);
+        }
+
+        .dtp-instance .xterm {
+            height: 100%;
+        }
+
+        .dtp-instance .xterm-viewport {
+            background-color: var(--dt-terminal-bg) !important;
+        }
+
+        .dtp-instance .xterm-viewport::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        .dtp-instance .xterm-viewport::-webkit-scrollbar-track {
+            background: var(--dt-terminal-bg);
+        }
+
+        .dtp-instance .xterm-viewport::-webkit-scrollbar-thumb {
+            background: var(--color-border);
+            border-radius: 4px;
+        }
+
+        .light-mode .dtp-panel {
+            --dt-terminal-bg: #fbfbfd;
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.6);
+        }
+
+        .light-mode .dtp-resize-handle {
+            background-image:
+                linear-gradient(rgba(15, 23, 42, 0.16), rgba(15, 23, 42, 0.16)),
+                linear-gradient(rgba(15, 23, 42, 0.16), rgba(15, 23, 42, 0.16));
+        }
+
+        .light-mode .dtp-tabs {
+            background: var(--color-panel);
+        }
+
+        .light-mode .dtp-tab {
+            background: #ffffff;
+            color: var(--color-text-muted);
+        }
+
+        .light-mode .dtp-tab:hover {
+            background: color-mix(in srgb, #ffffff 70%, var(--color-panel) 30%);
+        }
+
+        .light-mode .dtp-tab.active {
+            color: var(--color-primary);
+        }
+
+        .light-mode .dtp-tab-close:hover {
+            background: rgba(220, 38, 38, 0.12);
+            color: #dc2626;
+        }
+
+        .light-mode .dtp-loading {
+            color: var(--color-text-muted);
+        }
+
+        .light-mode .dtp-instance .xterm-viewport::-webkit-scrollbar-thumb {
+            background: color-mix(in srgb, var(--color-border) 80%, #cbd5e1 20%);
+        }
+    </style>
+</body>
+</html>

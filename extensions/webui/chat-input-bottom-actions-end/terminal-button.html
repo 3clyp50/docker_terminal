@@ -1,0 +1,46 @@
+<div x-data
+     @mouseenter="$store.dockerTerminal && $store.dockerTerminal.syncSelectedSessionCount()"
+     @focusin="$store.dockerTerminal && $store.dockerTerminal.syncSelectedSessionCount()">
+    <div class="terminal-button-wrap">
+        <button class="text-button"
+                id="docker_terminal"
+                @click="$store.dockerTerminal && $store.dockerTerminal.togglePanel()"
+                :title="$store.dockerTerminal ? $store.dockerTerminal.getTerminalButtonTitle() : 'Open terminal'">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="4 17 10 11 4 5"></polyline>
+                <line x1="12" y1="19" x2="20" y2="19"></line>
+            </svg>
+            <p>Terminal</p>
+        </button>
+
+        <template x-if="$store.dockerTerminal && $store.dockerTerminal.getSelectedSessionCount() > 0">
+            <span class="terminal-button-count"
+                  :title="$store.dockerTerminal.getTerminalButtonTitle()"
+                  x-text="$store.dockerTerminal.getSelectedSessionCount()"></span>
+        </template>
+    </div>
+</div>
+
+<style>
+    .terminal-button-wrap {
+        position: relative;
+        display: inline-flex;
+    }
+
+    .terminal-button-count {
+        position: absolute;
+        top: -4px;
+        right: -4px;
+        min-width: 14px;
+        height: 14px;
+        padding: 0 4px;
+        border-radius: 999px;
+        background: var(--color-accent);
+        color: #fff;
+        font-size: 0.58rem;
+        line-height: 14px;
+        text-align: center;
+        pointer-events: none;
+        box-shadow: 0 0 0 1px var(--color-panel);
+    }
+</style>

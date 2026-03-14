@@ -1,0 +1,12 @@
+# Leave empty to reuse the global workdir path.
+startup_directory: ""
+
+# Keep backend sessions alive when the panel is collapsed.
+preserve_sessions_on_hide: true
+
+# xterm.js appearance defaults.
+font_size: 14
+cursor_blink: true
+
+# Initial terminal panel height as a percentage of the viewport height.
+default_panel_height_vh: 40

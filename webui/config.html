@@ -1,0 +1,102 @@
+<html>
+<head>
+    <title>Docker Terminal</title>
+</head>
+
+<body>
+    <div x-data>
+        <template x-if="config">
+            <div>
+                <div class="section-title">Docker Terminal</div>
+                <div class="section-description">
+                    Configure the workspace terminal panel. These settings are global and do not depend on chats, contexts, or agent profiles.
+                </div>
+
+                <div class="section-title">Terminal startup</div>
+                <div class="section-description">
+                    Choose where new terminal sessions start. Leave it empty to use the global workdir setting.
+                </div>
+
+                <div class="field">
+                    <div class="field-label">
+                        <div class="field-title">Startup directory</div>
+                        <div class="field-description">
+                            Absolute path or `/a0/...` path used for new sessions. Empty means "use the global workdir".
+                        </div>
+                    </div>
+                    <div class="field-control">
+                        <input type="text"
+                               x-model="config.startup_directory"
+                               placeholder="(uses global workdir)" />
+                    </div>
+                </div>
+
+                <div class="section-title">Terminal behavior</div>
+                <div class="section-description">
+                    Control how the panel behaves when it is hidden.
+                </div>
+
+                <div class="field">
+                    <div class="field-label">
+                        <div class="field-title">Keep sessions running when hidden</div>
+                        <div class="field-description">
+                            If disabled, collapsing the panel closes all terminal sessions instead of preserving them in the background.
+                        </div>
+                    </div>
+                    <div class="field-control">
+                        <label class="toggle">
+                            <input type="checkbox" x-model="config.preserve_sessions_on_hide" />
+                            <span class="toggler"></span>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="section-title">Terminal appearance</div>
+                <div class="section-description">
+                    Tune the xterm.js presentation defaults used by the panel.
+                </div>
+
+                <div class="field">
+                    <div class="field-label">
+                        <div class="field-title">Font size</div>
+                        <div class="field-description">
+                            Base terminal font size in pixels.
+                        </div>
+                    </div>
+                    <div class="field-control">
+                        <input type="number" min="10" max="24" x-model.number="config.font_size" />
+                    </div>
+                </div>
+
+                <div class="field">
+                    <div class="field-label">
+                        <div class="field-title">Blinking cursor</div>
+                        <div class="field-description">
+                            Enable the xterm cursor blink animation.
+                        </div>
+                    </div>
+                    <div class="field-control">
+                        <label class="toggle">
+                            <input type="checkbox" x-model="config.cursor_blink" />
+                            <span class="toggler"></span>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="field">
+                    <div class="field-label">
+                        <div class="field-title">Default panel height</div>
+                        <div class="field-description">
+                            Initial panel height as viewport percentage. Manual resizing during the session still takes precedence.
+                        </div>
+                    </div>
+                    <div class="field-control">
+                        <input type="number" min="20" max="60" x-model.number="config.default_panel_height_vh" />
+                    </div>
+                </div>
+            </div>
+        </template>
+    </div>
+</body>
+
+</html>
