@@ -1,12 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 Docker Terminal API handler. Thin dispatch layer; shared logic lives in
-terminal_helpers/.
+helpers/.
 Workspace-scoped; no chat/context coupling.
 """
 
-import sys
-from pathlib import Path
 from typing import Any
 
 from flask import Request
@@ -15,11 +13,7 @@ from helpers import files, plugins, settings
 from helpers.api import ApiHandler
 import helpers.runtime as runtime
 
-_PLUGIN_ROOT = Path(__file__).resolve().parent.parent
-if str(_PLUGIN_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PLUGIN_ROOT))
-
-from terminal_helpers.session_runtime import (
+from usr.plugins.docker_terminal.helpers.session_runtime import (
     DEFAULT_COLS,
     DEFAULT_ROWS,
     create_terminal_session,

@@ -61,9 +61,23 @@ docker_terminal/
 ├── default_config.yaml
 ├── api/
 ├── extensions/
-├── terminal_helpers/
+├── helpers/
 └── webui/
 ```
+
+## Import Pattern
+
+Plugin-local Python imports should use the fully qualified `usr.plugins...`
+package path:
+
+```python
+import usr.plugins.docker_terminal.helpers.session_store as session_store
+from usr.plugins.docker_terminal.helpers.session_runtime import create_terminal_session
+```
+
+This avoids `sys.path` hacks, avoids persistent symlinks into `/a0/plugins/`,
+and keeps plugin imports reversible: when the plugin is removed, no global
+import wiring should remain behind.
 
 ## License
 
