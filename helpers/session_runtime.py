@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-PTY-backed terminal session runtime. Loop-independent so it works across RFC calls.
-Shared logic lives here; api/terminal.py keeps only the thin request handler.
+PTY-backed terminal runtime shared by websocket event handlers.
 """
+
+from __future__ import annotations
 
 import errno
 import fcntl
@@ -13,33 +14,55 @@ import signal
 import struct
 import subprocess
 import termios
-import time
-from typing import Any
+import threading
+from concurrent.futures import Future
+from typing import Any, Iterable
 
+from helpers import files, plugins, settings
+from helpers.defer import EventLoopThread
+from helpers.websocket_manager import send_data
 import helpers.runtime as runtime
 
 import usr.plugins.docker_terminal.helpers.session_store as session_store
 
+PLUGIN_NAME = "docker_terminal"
+
 DEFAULT_COLS = 120
 DEFAULT_ROWS = 40
 READ_CHUNK_SIZE = 65536
-READ_IDLE_TIMEOUT = 0.01
+READ_SELECT_TIMEOUT = 0.25
+
+SUBSCRIBE_EVENT = "docker_terminal_subscribe"
+INPUT_EVENT = "docker_terminal_input"
+CREATE_EVENT = "docker_terminal_create"
+CLOSE_EVENT = "docker_terminal_close"
+CLOSE_ALL_EVENT = "docker_terminal_close_all"
+RESIZE_EVENT = "docker_terminal_resize"
+OUTPUT_EVENT = "docker_terminal_output"
+SESSION_CREATED_EVENT = "docker_terminal_session_created"
+SESSION_CLOSED_EVENT = "docker_terminal_session_closed"
+SESSIONS_CLEARED_EVENT = "docker_terminal_sessions_cleared"
+
+_OUTPUT_LOOP: EventLoopThread | None = None
+_OUTPUT_LOOP_LOCK = threading.Lock()
 
 
 class RawLocalSession:
-    """PTY session that does not retain asyncio-bound objects between RFC calls."""
+    """PTY session with a dedicated background reader thread."""
 
     def __init__(self, cwd: str | None = None):
         self.cwd = cwd
         self.encoding = "utf-8"
         self.master_fd: int | None = None
         self.proc: subprocess.Popen[bytes] | None = None
+        self._closed = threading.Event()
+        self._reader_thread: threading.Thread | None = None
 
-    def connect(self):
+    def connect(self) -> None:
         master_fd, slave_fd = pty.openpty()
         command = self._build_command()
 
-        def _preexec():
+        def _preexec() -> None:
             os.setsid()
             fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
 
@@ -62,7 +85,33 @@ class RawLocalSession:
         os.set_blocking(master_fd, False)
         self.master_fd = master_fd
 
-    def send_raw(self, data: str):
+    def start_reader(
+        self,
+        on_output: Any,
+        on_exit: Any,
+    ) -> None:
+        if self.master_fd is None:
+            raise RuntimeError("Not connected")
+        if self._reader_thread and self._reader_thread.is_alive():
+            return
+
+        def _run() -> None:
+            try:
+                self._read_loop(on_output)
+            finally:
+                try:
+                    on_exit()
+                except Exception:
+                    pass
+
+        self._reader_thread = threading.Thread(
+            target=_run,
+            daemon=True,
+            name=f"DockerTerminalReader-{id(self)}",
+        )
+        self._reader_thread.start()
+
+    def send_raw(self, data: str) -> None:
         if self.master_fd is None:
             raise RuntimeError("Not connected")
 
@@ -71,43 +120,20 @@ class RawLocalSession:
             written = os.write(self.master_fd, payload)
             payload = payload[written:]
 
-    def read_raw(self, timeout: float = 0.15) -> str:
+    def read_raw(self, timeout: float = 0.0) -> str:
         if self.master_fd is None:
             raise RuntimeError("Not connected")
 
-        deadline = time.monotonic() + max(float(timeout or 0), 0)
-        chunks: list[bytes] = []
-
-        while time.monotonic() < deadline:
-            remaining = deadline - time.monotonic()
-            wait_for = min(READ_IDLE_TIMEOUT if chunks else remaining, remaining)
-            if wait_for <= 0:
-                break
-
+        wait_for = max(float(timeout or 0), 0.0)
+        if wait_for > 0:
             ready, _, _ = select.select([self.master_fd], [], [], wait_for)
             if not ready:
-                if chunks:
-                    break
-                continue
+                return ""
 
-            try:
-                data = os.read(self.master_fd, READ_CHUNK_SIZE)
-            except BlockingIOError:
-                if chunks:
-                    break
-                continue
-            except OSError as error:
-                if error.errno in (errno.EIO, errno.EBADF):
-                    break
-                raise
+        return self._drain_available()
 
-            if not data:
-                break
-            chunks.append(data)
-
-        return b"".join(chunks).decode(self.encoding, "replace")
-
-    def close(self):
+    def close(self) -> None:
+        self._closed.set()
         proc = self.proc
         self.proc = None
 
@@ -119,14 +145,11 @@ class RawLocalSession:
                 proc.kill()
                 proc.wait(timeout=0.5)
 
-        if self.master_fd is not None:
-            try:
-                os.close(self.master_fd)
-            except OSError:
-                pass
-            self.master_fd = None
+        self._close_master_fd()
+        self._join_reader()
 
-    def force_close(self):
+    def force_close(self) -> None:
+        self._closed.set()
         proc = self.proc
         self.proc = None
 
@@ -137,14 +160,10 @@ class RawLocalSession:
             except Exception:
                 pass
 
-        if self.master_fd is not None:
-            try:
-                os.close(self.master_fd)
-            except OSError:
-                pass
-            self.master_fd = None
+        self._close_master_fd()
+        self._join_reader()
 
-    def resize(self, cols: int, rows: int):
+    def resize(self, cols: int, rows: int) -> None:
         if self.master_fd is None or self.proc is None:
             return
 
@@ -163,40 +182,154 @@ class RawLocalSession:
             except ProcessLookupError:
                 pass
 
+    def _read_loop(self, on_output: Any) -> None:
+        while not self._closed.is_set():
+            if self.master_fd is None:
+                break
+
+            if self.proc is not None and self.proc.poll() is not None:
+                remaining = self._drain_available()
+                if remaining:
+                    self._safe_deliver(on_output, remaining)
+                break
+
+            try:
+                ready, _, _ = select.select(
+                    [self.master_fd],
+                    [],
+                    [],
+                    READ_SELECT_TIMEOUT,
+                )
+            except OSError as error:
+                if error.errno in (errno.EBADF,):
+                    break
+                raise
+
+            if not ready:
+                continue
+
+            chunk = self._drain_available()
+            if chunk:
+                self._safe_deliver(on_output, chunk)
+                continue
+
+            if self.proc is not None and self.proc.poll() is not None:
+                break
+
+        tail = self._drain_available()
+        if tail:
+            self._safe_deliver(on_output, tail)
+
+    def _drain_available(self) -> str:
+        if self.master_fd is None:
+            return ""
+
+        chunks: list[bytes] = []
+        while True:
+            try:
+                data = os.read(self.master_fd, READ_CHUNK_SIZE)
+            except BlockingIOError:
+                break
+            except OSError as error:
+                if error.errno in (errno.EIO, errno.EBADF):
+                    break
+                raise
+
+            if not data:
+                break
+            chunks.append(data)
+
+            if len(data) < READ_CHUNK_SIZE:
+                break
+
+        return b"".join(chunks).decode(self.encoding, "replace")
+
     def _build_command(self) -> list[str]:
         executable = runtime.get_terminal_executable()
         if os.name == "posix" and os.path.basename(executable) in {"bash", "sh", "zsh"}:
             return [executable, "-i"]
         return [executable]
 
+    def _close_master_fd(self) -> None:
+        if self.master_fd is None:
+            return
+        try:
+            os.close(self.master_fd)
+        except OSError:
+            pass
+        self.master_fd = None
+
+    def _join_reader(self) -> None:
+        thread = self._reader_thread
+        if not thread or thread is threading.current_thread():
+            return
+        thread.join(timeout=0.5)
+
+    def _safe_deliver(self, on_output: Any, output: str) -> None:
+        if not output:
+            return
+        try:
+            on_output(output)
+        except Exception:
+            pass
+
+
+def resolve_terminal_cwd() -> str | None:
+    config = plugins.get_plugin_config(
+        PLUGIN_NAME,
+        agent=None,
+        project_name="",
+        agent_profile="",
+    )
+    if isinstance(config, dict):
+        configured = _normalize_configured_path(config.get("startup_directory"))
+        if configured:
+            return configured
+
+    path = settings.get_settings().get("workdir_path")
+    if not path:
+        return None
+    return files.normalize_a0_path(path)
+
 
 def create_terminal_session(
-    cwd: str | None,
+    cwd: str | None = None,
     cols: int = DEFAULT_COLS,
     rows: int = DEFAULT_ROWS,
 ) -> dict[str, Any]:
-    sid = session_store.next_session_id()
-    session = RawLocalSession(cwd=cwd)
+    resolved_cwd = cwd or resolve_terminal_cwd()
+    session_id = session_store.next_session_id()
+    session = RawLocalSession(cwd=resolved_cwd)
 
     try:
-        if cwd:
-            os.makedirs(cwd, exist_ok=True)
+        if resolved_cwd:
+            os.makedirs(resolved_cwd, exist_ok=True)
         session.connect()
+        session_store.add_session(
+            session_id,
+            {
+                "id": session_id,
+                "session": session,
+                "cwd": resolved_cwd or "~",
+                "type": "local",
+            },
+        )
         session.resize(cols, rows)
+        session.start_reader(
+            lambda output: _handle_session_output(session_id, output),
+            lambda: _handle_session_exit(session_id),
+        )
     except Exception as error:
+        session_store.remove_session(session_id)
         session.force_close()
         return {"ok": False, "error": str(error)}
 
-    session_store.add_session(
-        sid,
-        {
-            "id": sid,
-            "session": session,
-            "cwd": cwd or "~",
-            "type": "local",
-        },
-    )
-    return {"ok": True, "session_id": sid, "type": "local", "cwd": cwd or "~"}
+    snapshot = session_store.snapshot_session(session_id, include_buffer=True)
+    if snapshot is None:
+        return {"ok": False, "error": "Failed to snapshot session"}
+
+    _schedule_broadcast(SESSION_CREATED_EVENT, {"session": snapshot})
+    return {"ok": True, "session": snapshot}
 
 
 def send_terminal_input(session_id: int | None, data: str) -> dict[str, Any]:
@@ -211,7 +344,7 @@ def send_terminal_input(session_id: int | None, data: str) -> dict[str, Any]:
         return {"ok": False, "error": str(error)}
 
 
-def read_terminal_output(session_id: int | None, timeout: float = 0.15) -> dict[str, Any]:
+def read_terminal_output(session_id: int | None, timeout: float = 0.0) -> dict[str, Any]:
     entry = session_store.get_session(session_id)
     if not entry:
         return {"ok": False, "error": "Session not found"}
@@ -223,48 +356,66 @@ def read_terminal_output(session_id: int | None, timeout: float = 0.15) -> dict[
         return {"ok": False, "error": str(error)}
 
 
+def subscribe_terminal_client(sid: str, subscribe: bool = True) -> dict[str, Any]:
+    if subscribe:
+        session_store.subscribe(sid)
+    else:
+        session_store.unsubscribe(sid)
+
+    return {
+        "ok": True,
+        "subscribed": bool(subscribe),
+        "sessions": session_store.snapshot_sessions(include_buffers=True),
+    }
+
+
+def remove_terminal_client(sid: str) -> None:
+    session_store.unsubscribe(sid)
+
+
 def close_terminal_session(session_id: int | None) -> dict[str, Any]:
-    entry = session_store.get_session(session_id)
+    entry = session_store.pop_session(session_id)
     if not entry:
         return {"ok": False, "error": "Session not found"}
 
     try:
-        entry["session"].close()
+        session = entry.get("session")
+        if session:
+            session.close()
     finally:
-        session_store.remove_session(session_id)
+        _schedule_broadcast(
+            SESSION_CLOSED_EVENT,
+            {"session_id": session_id},
+        )
     return {"ok": True}
 
 
-def _close_all_sessions(force: bool = False) -> dict[str, Any]:
-    sessions = list(session_store.get_sessions().values())
+def close_all_terminal_sessions() -> dict[str, Any]:
+    entries = session_store.reset_state(clear_subscribers=False)
     closed = 0
-    for entry in sessions:
+
+    for entry in entries.values():
         session = entry.get("session")
         if not session:
             continue
-        close_fn = getattr(session, "force_close", None) if force else getattr(session, "close", None)
-        if not callable(close_fn):
-            continue
         try:
-            close_fn()
+            session.close()
             closed += 1
         except Exception:
             pass
 
-    session_store.reset_state()
+    _schedule_broadcast(
+        SESSIONS_CLEARED_EVENT,
+        {"closed": closed},
+    )
     return {"ok": True, "closed": closed}
 
 
-def close_all_terminal_sessions() -> dict[str, Any]:
-    return _close_all_sessions(force=False)
-
-
-def list_terminal_sessions() -> dict[str, Any]:
-    sessions = [
-        {"id": sid, "type": entry["type"], "cwd": entry["cwd"]}
-        for sid, entry in sorted(session_store.get_sessions().items())
-    ]
-    return {"ok": True, "sessions": sessions}
+def list_terminal_sessions(include_buffers: bool = True) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "sessions": session_store.snapshot_sessions(include_buffers=include_buffers),
+    }
 
 
 def resize_terminal_session(
@@ -281,3 +432,101 @@ def resize_terminal_session(
         return {"ok": True}
     except Exception as error:
         return {"ok": False, "error": str(error)}
+
+
+def _normalize_configured_path(path: Any) -> str | None:
+    raw_path = str(path or "").strip()
+    if not raw_path:
+        return None
+
+    absolute_path = files.get_abs_path(raw_path)
+    development_path = files.fix_dev_path(absolute_path)
+    return files.normalize_a0_path(development_path)
+
+
+def _handle_session_output(session_id: int, output: str) -> None:
+    subscribers = session_store.append_output(session_id, output)
+    if not subscribers:
+        return
+
+    _schedule_push(
+        OUTPUT_EVENT,
+        {"session_id": session_id, "output": output},
+        subscribers,
+    )
+
+
+def _handle_session_exit(session_id: int) -> None:
+    entry = session_store.pop_session(session_id)
+    if not entry:
+        return
+
+    session = entry.get("session")
+    if session:
+        try:
+            session.force_close()
+        except Exception:
+            pass
+
+    _schedule_broadcast(
+        SESSION_CLOSED_EVENT,
+        {"session_id": session_id},
+    )
+
+
+def _schedule_broadcast(event_name: str, data: dict[str, Any]) -> None:
+    subscribers = session_store.get_subscribers()
+    if not subscribers:
+        return
+    _schedule_push(event_name, data, subscribers)
+
+
+def _schedule_push(
+    event_name: str,
+    data: dict[str, Any],
+    subscribers: Iterable[str],
+) -> None:
+    audience = tuple(sorted({sid for sid in subscribers if sid}))
+    if not audience:
+        return
+
+    future = _get_output_loop().run_coroutine(
+        _push_to_subscribers(audience, event_name, data)
+    )
+    future.add_done_callback(_discard_future_exception)
+
+
+async def _push_to_subscribers(
+    subscribers: Iterable[str],
+    event_name: str,
+    data: dict[str, Any],
+) -> None:
+    stale: list[str] = []
+    for sid in subscribers:
+        try:
+            await send_data(
+                event_name=event_name,
+                data=data,
+                endpoint_name="/webui",
+                connection_id=sid,
+            )
+        except Exception:
+            stale.append(sid)
+
+    for sid in stale:
+        session_store.unsubscribe(sid)
+
+
+def _get_output_loop() -> EventLoopThread:
+    global _OUTPUT_LOOP
+    with _OUTPUT_LOOP_LOCK:
+        if _OUTPUT_LOOP is None:
+            _OUTPUT_LOOP = EventLoopThread("DockerTerminalWebSocket")
+        return _OUTPUT_LOOP
+
+
+def _discard_future_exception(future: Future[Any]) -> None:
+    try:
+        future.result()
+    except Exception:
+        pass

@@ -1,18 +1,34 @@
 import { createStore } from "/js/AlpineStore.js";
 import { callJsonApi } from "/js/api.js";
+import { getNamespacedClient } from "/js/websocket.js";
 import { store as notificationStore } from "/components/notifications/notification-store.js";
 
 const PLUGIN_NAME = "docker_terminal";
-const TERMINAL_API = `plugins/${PLUGIN_NAME}/terminal`;
+const SOCKET = getNamespacedClient("/webui");
+
 const XTERM_CSS = "https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css";
 const XTERM_JS = "https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js";
 const FIT_JS = "https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js";
+
 const BUFFER_LIMIT = 200000;
 const MIN_HEIGHT = 200;
 const MAX_VH = 0.6;
 const DEFAULT_VH = 0.4;
-const INPUT_BATCH_MS = 30;
-const POLL_MS = 250;
+const DEFAULT_COLS = 120;
+const DEFAULT_ROWS = 40;
+
+const EVENT = Object.freeze({
+    subscribe: "docker_terminal_subscribe",
+    input: "docker_terminal_input",
+    create: "docker_terminal_create",
+    close: "docker_terminal_close",
+    closeAll: "docker_terminal_close_all",
+    resize: "docker_terminal_resize",
+    output: "docker_terminal_output",
+    sessionCreated: "docker_terminal_session_created",
+    sessionClosed: "docker_terminal_session_closed",
+    sessionsCleared: "docker_terminal_sessions_cleared",
+});
 
 /** @type {Window & { Terminal?: any, FitAddon?: { FitAddon: new () => any } }} */
 const W = window;
@@ -50,7 +66,9 @@ function clampHeight(px) {
 }
 
 function vhToPx(vh) {
-    return clampHeight(Math.round(innerHeight * (Number(vh || 0) / 100)) || Math.round(innerHeight * DEFAULT_VH));
+    return clampHeight(
+        Math.round(innerHeight * (Number(vh || 0) / 100)) || Math.round(innerHeight * DEFAULT_VH),
+    );
 }
 
 function errMsg(error, fallback) {
@@ -65,6 +83,7 @@ function loadScript(url) {
             existing.addEventListener("error", () => reject(new Error(`Failed to load ${url}`)), { once: true });
             return;
         }
+
         const el = document.createElement("script");
         el.src = url;
         el.onload = resolve;
@@ -74,10 +93,63 @@ function loadScript(url) {
 }
 
 function afterPaint() {
-    return new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 }
 
-// ── store ──
+function normalizeSession(raw) {
+    const id = Number(raw?.id);
+    if (!Number.isInteger(id) || id < 0) return null;
+
+    return {
+        id,
+        name: `Session ${id + 1}`,
+        type: typeof raw?.type === "string" && raw.type ? raw.type : "local",
+        cwd: typeof raw?.cwd === "string" && raw.cwd ? raw.cwd : "~",
+        buffer: typeof raw?.buffer === "string" ? raw.buffer.slice(-BUFFER_LIMIT) : "",
+    };
+}
+
+function normalizeSessions(rawSessions) {
+    if (!Array.isArray(rawSessions)) return [];
+
+    const byId = new Map();
+    for (const raw of rawSessions) {
+        const session = normalizeSession(raw);
+        if (session) byId.set(session.id, session);
+    }
+
+    return [...byId.values()].sort((left, right) => left.id - right.id);
+}
+
+function pickSessionId(sessions, ...candidates) {
+    const ids = new Set(sessions.map((session) => session.id));
+    for (const candidate of candidates) {
+        if (ids.has(candidate)) return candidate;
+    }
+    return sessions[0]?.id ?? null;
+}
+
+function mergeBuffer(current, incoming) {
+    if (typeof incoming !== "string") return current || "";
+    if (!current) return incoming.slice(-BUFFER_LIMIT);
+    return incoming.length >= current.length ? incoming.slice(-BUFFER_LIMIT) : current;
+}
+
+function requestData(response) {
+    const first = Array.isArray(response?.results) ? response.results[0] : null;
+    if (!first) return {};
+
+    if (first.ok === false) {
+        throw new Error(first.error?.error || first.error?.code || "Terminal request failed.");
+    }
+
+    const data = first.data && typeof first.data === "object" ? first.data : {};
+    if (data.ok === false) {
+        throw new Error(data.error || "Terminal request failed.");
+    }
+
+    return data;
+}
 
 const model = {
     panelOpen: false,
@@ -88,16 +160,23 @@ const model = {
     config: { ...DEFAULT_CONFIG },
 
     _terms: {},
-    _pollId: null,
+    _buffers: {},
+    _cachedCount: 0,
+    _preferredSessionId: null,
+
     _xtermReady: false,
     _xtermLoading: null,
     _configLoaded: false,
+
+    _socketLifecycleBound: false,
+    _socketEventsBound: false,
+    _socketConnected: false,
+    _subscribed: false,
+    _subscribePromise: null,
+    _socketHandlers: null,
+
     _isCleaningUp: false,
     _panelHeightCustom: false,
-    _buffers: {},
-    _inputQueues: {},
-    _inputTimers: {},
-    _cachedCount: 0,
     _resizing: false,
     _resizeY: 0,
     _resizeH: 0,
@@ -113,24 +192,25 @@ const model = {
     },
 
     getTerminalButtonTitle() {
-        const n = this.getSelectedSessionCount();
-        return n === 0 ? "Open terminal" : `${n} active terminal${n === 1 ? "" : "s"}`;
+        const count = this.getSelectedSessionCount();
+        return count === 0 ? "Open terminal" : `${count} active terminal${count === 1 ? "" : "s"}`;
     },
 
     async syncSelectedSessionCount() {
         if (this.panelOpen) return;
-        try {
-            const res = await this._api("list");
-            if (res.ok && Array.isArray(res.sessions)) this._cachedCount = res.sessions.length;
-        } catch (_) { /* ignore */ }
-    },
+        this._bindSocketLifecycle();
 
-    // ── panel lifecycle ──
+        try {
+            const data = await this._request(EVENT.subscribe, { subscribe: false });
+            this._cachedCount = Array.isArray(data.sessions) ? data.sessions.length : 0;
+        } catch (_) {
+            // Ignore passive count refresh failures.
+        }
+    },
 
     async togglePanel() {
         if (this.panelOpen) {
             this._isCleaningUp = true;
-            this._stopPoll();
             this._endDrag();
             this.panelOpen = false;
             return;
@@ -140,10 +220,13 @@ const model = {
         await this._loadConfig(true);
         this.panelOpen = true;
         this.loading = true;
+
         try {
             await afterPaint();
             await this._openPanel();
         } catch (error) {
+            this.panelOpen = false;
+            this.cleanup();
             this._err(errMsg(error, "Failed to open the terminal."));
         } finally {
             this.loading = false;
@@ -152,51 +235,54 @@ const model = {
 
     async _openPanel() {
         await this._loadXterm();
-        this._resetState();
-
-        const res = await this._api("list");
-        if (!res.ok) throw new Error(res.error || "Failed to list sessions.");
-
-        this.sessions = (res.sessions || []).map((s) => ({
-            id: s.id, name: `Session ${s.id + 1}`, type: s.type, cwd: s.cwd,
-        }));
-        this._cachedCount = this.sessions.length;
-        this._pruneBuffers();
-        this._startPoll();
+        this._resetPanelState();
+        this._bindSocketLifecycle();
+        await this._bindSocketEvents();
+        await this._subscribeSessions({ refreshTerms: false });
+        if (!this.panelOpen || !this._subscribed) return;
 
         if (this.sessions.length === 0) {
             await this.createSession();
-        } else {
-            await this._activate(this.sessions[0].id);
+            return;
+        }
+
+        const targetId = pickSessionId(
+            this.sessions,
+            this._preferredSessionId,
+            this.activeSessionId,
+        );
+        if (targetId !== null) {
+            await this._activate(targetId);
         }
     },
 
     startResize(event) {
         if (!this.panelOpen) return;
+
         event.preventDefault();
         this._resizing = true;
         this._resizeY = event.clientY;
         this._resizeH = this.panelHeight;
 
         if (!this._boundMove) {
-            this._boundMove = (e) => this._onDrag(e);
+            this._boundMove = (moveEvent) => this._onDrag(moveEvent);
             this._boundEnd = () => this._endDrag();
         }
+
         document.addEventListener("mousemove", this._boundMove);
         document.addEventListener("mouseup", this._boundEnd);
     },
 
-    // ── session operations ──
-
     async createSession() {
         this.loading = true;
         try {
-            const res = await this._api("create");
-            if (!res.ok) throw new Error(res.error || "Failed to create session.");
-
-            const session = { id: res.session_id, name: `Session ${res.session_id + 1}`, type: res.type, cwd: res.cwd };
-            this.sessions = [...this.sessions, session];
-            this._cachedCount = this.sessions.length;
+            const data = await this._request(
+                EVENT.create,
+                this._getCreatePayload(),
+            );
+            if (!this.panelOpen || !this._subscribed) return;
+            const session = this._upsertSession(data.session);
+            if (!session) throw new Error("Failed to create session.");
             await this._activate(session.id);
         } catch (error) {
             this._err(errMsg(error, "Failed to create session."));
@@ -207,27 +293,17 @@ const model = {
 
     async closeSession(sessionId) {
         try {
-            const res = await this._api("close", { session_id: sessionId });
-            if (!res.ok && res.error !== "Session not found") {
-                throw new Error(res.error || "Failed to close session.");
-            }
+            await this._request(EVENT.close, { session_id: sessionId });
         } catch (error) {
+            if (error instanceof Error && error.message === "Session not found") {
+                this._removeSession(sessionId);
+                return;
+            }
             this._err(errMsg(error, "Failed to close session."));
             return;
         }
 
-        this._disposeTerm(sessionId);
-        delete this._buffers[sessionId];
-        this.sessions = this.sessions.filter((s) => s.id !== sessionId);
-        this._cachedCount = this.sessions.length;
-
-        if (this.activeSessionId === sessionId) {
-            if (this.sessions.length > 0) {
-                await this._activate(this.sessions[0].id);
-            } else {
-                this.activeSessionId = null;
-            }
-        }
+        this._removeSession(sessionId);
     },
 
     async switchSession(sessionId) {
@@ -236,20 +312,29 @@ const model = {
 
     cleanup() {
         const preserve = this.config.preserve_sessions_on_hide !== false;
-        this._cachedCount = preserve ? this.sessions.length : 0;
-        this._endDrag();
-        this._stopPoll();
-        this._disposeAllTerms();
-        if (!preserve) this._buffers = {};
-        this._resetState();
+        const cachedCount = preserve ? this.sessions.length : 0;
+        const preferredSessionId = preserve ? this.activeSessionId : null;
+        const unsubscribePromise = this._subscribed ? this._unsubscribeSessions() : null;
+
+        this._cachedCount = cachedCount;
+        this._preferredSessionId = preferredSessionId;
         this._isCleaningUp = true;
 
+        this._endDrag();
+        this._unbindSocketEvents();
+        this._disposeAllTerms();
+        this._resetPanelState();
+
+        if (unsubscribePromise) void unsubscribePromise;
+
         if (!preserve) {
-            this._api("close_all").catch((e) => this._err(errMsg(e, "Failed to close sessions.")));
+            this._cachedCount = 0;
+            this._preferredSessionId = null;
+            void this._request(EVENT.closeAll).catch((error) => {
+                this._err(errMsg(error, "Failed to close sessions."));
+            });
         }
     },
-
-    // ── xterm ──
 
     async _loadXterm() {
         if (this._xtermReady || (W.Terminal && W.FitAddon)) {
@@ -265,11 +350,15 @@ const model = {
                 link.href = XTERM_CSS;
                 document.head.appendChild(link);
             }
+
             if (!W.Terminal) await loadScript(XTERM_JS);
             if (!W.FitAddon) await loadScript(FIT_JS);
+
             this._xtermReady = Boolean(W.Terminal && W.FitAddon);
             if (!this._xtermReady) throw new Error("xterm assets did not load.");
-        })().finally(() => { this._xtermLoading = null; });
+        })().finally(() => {
+            this._xtermLoading = null;
+        });
 
         return this._xtermLoading;
     },
@@ -278,8 +367,8 @@ const model = {
         if (this._terms[sessionId]) return this._terms[sessionId];
         if (!W.Terminal || !W.FitAddon) return null;
 
-        const el = document.getElementById(`terminal-${sessionId}`);
-        if (!el) return null;
+        const element = document.getElementById(`terminal-${sessionId}`);
+        if (!element) return null;
 
         const term = new W.Terminal({
             cursorBlink: this.config.cursor_blink,
@@ -290,164 +379,343 @@ const model = {
 
         const fitAddon = new W.FitAddon.FitAddon();
         term.loadAddon(fitAddon);
-        term.open(el);
+        term.open(element);
 
-        const buf = this._buffers[sessionId];
-        if (buf) term.write(buf);
+        const buffer = this._buffers[sessionId];
+        if (buffer) term.write(buffer);
 
-        term.onData((data) => this._enqueueInput(sessionId, data === "\r" ? "\n" : data));
-        el.addEventListener("mousedown", () => this._focusTerm(sessionId));
+        term.onData((data) => {
+            if (!this.panelOpen || !this._subscribed || !this._socketConnected) return;
+            void this._emit(EVENT.input, { session_id: sessionId, data }).catch((error) => {
+                if (!this._isCleaningUp && this.panelOpen) {
+                    this._err(errMsg(error, "Failed to send input."));
+                }
+            });
+        });
 
-        const ro = new ResizeObserver(() => {
+        element.addEventListener("mousedown", () => this._focusTerm(sessionId));
+
+        const resizeObserver = new ResizeObserver(() => {
             if (this.activeSessionId === sessionId) this._fitResize(sessionId);
         });
-        ro.observe(el);
+        resizeObserver.observe(element);
 
-        this._terms[sessionId] = { element: el, fitAddon, resizeObserver: ro, term };
-        return this._terms[sessionId];
+        const entry = { element, fitAddon, resizeObserver, term };
+        this._terms[sessionId] = entry;
+        return entry;
     },
 
     _fitResize(sessionId) {
-        const e = this._terms[sessionId];
-        if (!e) return;
-        try { e.fitAddon.fit(); } catch (_) { return; }
-        this._api("resize", { session_id: sessionId, cols: e.term.cols, rows: e.term.rows }).catch(() => {});
+        const entry = this._terms[sessionId];
+        if (!entry) return;
+
+        try {
+            entry.fitAddon.fit();
+        } catch (_) {
+            return;
+        }
+
+        void this._request(EVENT.resize, {
+            session_id: sessionId,
+            cols: entry.term.cols,
+            rows: entry.term.rows,
+        }).catch(() => {});
     },
 
     _focusTerm(sessionId) {
-        const e = this._terms[sessionId];
-        if (e) requestAnimationFrame(() => e.term.focus());
+        const entry = this._terms[sessionId];
+        if (entry) requestAnimationFrame(() => entry.term.focus());
     },
 
-    // ── input batching ──
+    async _activate(sessionId) {
+        const normalizedId = Number(sessionId);
+        if (!Number.isInteger(normalizedId) || !this.panelOpen) return;
 
-    _enqueueInput(sessionId, data) {
-        this._inputQueues[sessionId] = (this._inputQueues[sessionId] || "") + data;
-        if (this._inputTimers[sessionId] != null) return;
-        this._inputTimers[sessionId] = setTimeout(() => this._flushInput(sessionId), INPUT_BATCH_MS);
+        this.activeSessionId = normalizedId;
+        this._preferredSessionId = normalizedId;
+
+        await afterPaint();
+        if (!this.panelOpen || this.activeSessionId !== normalizedId) return;
+
+        const entry = this._ensureTerm(normalizedId);
+        if (!entry) return;
+
+        this._fitResize(normalizedId);
+        this._focusTerm(normalizedId);
     },
 
-    _flushInput(sessionId) {
-        delete this._inputTimers[sessionId];
-        const queued = this._inputQueues[sessionId];
-        if (!queued) return;
-        delete this._inputQueues[sessionId];
-        this._api("send", { session_id: sessionId, data: queued }).catch((error) => {
-            if (!this._isCleaningUp) this._err(errMsg(error, "Failed to send input."));
+    async _bindSocketEvents() {
+        if (this._socketEventsBound) return;
+
+        this._socketHandlers = {
+            output: (envelope) => this._handleOutput(envelope.data),
+            sessionCreated: (envelope) => this._handleSessionCreated(envelope.data),
+            sessionClosed: (envelope) => this._handleSessionClosed(envelope.data),
+            sessionsCleared: () => this._handleSessionsCleared(),
+        };
+
+        await Promise.all([
+            SOCKET.on(EVENT.output, this._socketHandlers.output),
+            SOCKET.on(EVENT.sessionCreated, this._socketHandlers.sessionCreated),
+            SOCKET.on(EVENT.sessionClosed, this._socketHandlers.sessionClosed),
+            SOCKET.on(EVENT.sessionsCleared, this._socketHandlers.sessionsCleared),
+        ]);
+
+        this._socketConnected = SOCKET.isConnected();
+        this._socketEventsBound = true;
+    },
+
+    _unbindSocketEvents() {
+        if (!this._socketEventsBound || !this._socketHandlers) return;
+
+        SOCKET.off(EVENT.output, this._socketHandlers.output);
+        SOCKET.off(EVENT.sessionCreated, this._socketHandlers.sessionCreated);
+        SOCKET.off(EVENT.sessionClosed, this._socketHandlers.sessionClosed);
+        SOCKET.off(EVENT.sessionsCleared, this._socketHandlers.sessionsCleared);
+
+        this._socketHandlers = null;
+        this._socketEventsBound = false;
+    },
+
+    _bindSocketLifecycle() {
+        if (this._socketLifecycleBound) return;
+
+        this._socketLifecycleBound = true;
+        this._socketConnected = SOCKET.isConnected();
+
+        SOCKET.onConnect(() => {
+            this._socketConnected = true;
+            if (this.panelOpen && this._subscribed) {
+                void this._subscribeSessions({ refreshTerms: true });
+            }
+        });
+
+        SOCKET.onDisconnect(() => {
+            this._socketConnected = false;
+        });
+
+        SOCKET.onError((error) => {
+            if (!this.panelOpen || this._isCleaningUp) return;
+            this._err(errMsg(error, "Terminal websocket error."));
         });
     },
 
-    // ── polling ──
+    async _subscribeSessions({ refreshTerms }) {
+        if (this._subscribePromise) return this._subscribePromise;
 
-    async _pollActive() {
-        if (this.activeSessionId === null) return;
-        const sid = this.activeSessionId;
+        this._subscribed = true;
+        this._subscribePromise = this._request(EVENT.subscribe, { subscribe: true })
+            .then((data) => {
+                if (!this.panelOpen || !this._subscribed) return;
+                return this._applySnapshot(data.sessions, { refreshTerms });
+            })
+            .finally(() => {
+                this._subscribePromise = null;
+            });
+
+        return this._subscribePromise;
+    },
+
+    async _unsubscribeSessions() {
+        if (!this._subscribed) return;
+
+        this._subscribed = false;
         try {
-            const res = await this._api("read", { session_id: sid });
-            if (!res.ok) {
-                if (!this._isCleaningUp && res.error && res.error !== "Session not found") this._err(res.error);
-                return;
-            }
-            if (!res.output) return;
-            this._appendBuffer(sid, res.output);
-            const e = this._ensureTerm(sid);
-            if (e) e.term.write(res.output);
-        } catch (error) {
-            if (!this._isCleaningUp) this._err(errMsg(error, "Failed to read output."));
+            await this._request(EVENT.subscribe, { subscribe: false });
+        } catch (_) {
+            // Best effort on panel teardown.
         }
     },
 
-    _startPoll() {
-        if (this._pollId) return;
-        this._pollId = setInterval(() => void this._pollActive(), POLL_MS);
+    async _applySnapshot(rawSessions, { refreshTerms = false } = {}) {
+        const sessions = normalizeSessions(rawSessions);
+        const nextActiveId = pickSessionId(
+            sessions,
+            this.activeSessionId,
+            this._preferredSessionId,
+        );
+
+        const nextBuffers = {};
+        for (const session of sessions) {
+            nextBuffers[session.id] = session.buffer;
+        }
+
+        if (refreshTerms) this._disposeAllTerms();
+
+        this.sessions = sessions.map(({ buffer, ...session }) => session);
+        this._buffers = nextBuffers;
+        this._cachedCount = this.sessions.length;
+        this.activeSessionId = nextActiveId;
+        this._preferredSessionId = nextActiveId;
+
+        if (nextActiveId !== null && this.panelOpen) {
+            await this._activate(nextActiveId);
+        }
     },
 
-    _stopPoll() {
-        if (this._pollId) { clearInterval(this._pollId); this._pollId = null; }
+    _handleOutput(payload = {}) {
+        if (!this.panelOpen || !this._subscribed) return;
+
+        const sessionId = Number(payload.session_id);
+        const output = typeof payload.output === "string" ? payload.output : "";
+        if (!Number.isInteger(sessionId) || !output) return;
+
+        this._appendBuffer(sessionId, output);
+
+        const entry = this._terms[sessionId];
+        if (entry) entry.term.write(output);
     },
 
-    // ── session activation ──
+    _handleSessionCreated(payload = {}) {
+        if (!this.panelOpen || !this._subscribed) return;
 
-    async _activate(sessionId) {
-        this.activeSessionId = sessionId;
-        await afterPaint();
-        this._ensureTerm(sessionId);
-        this._fitResize(sessionId);
-        this._focusTerm(sessionId);
-        await this._pollActive();
+        const hadSessions = this.sessions.length > 0;
+        const session = this._upsertSession(payload.session);
+        if (!session) return;
+
+        if (!hadSessions && this.activeSessionId === null) {
+            void this._activate(session.id);
+        }
     },
 
-    // ── buffer helpers ──
+    _handleSessionClosed(payload = {}) {
+        if (!this.panelOpen || !this._subscribed) return;
+        this._removeSession(payload.session_id);
+    },
+
+    _handleSessionsCleared() {
+        if (!this.panelOpen || !this._subscribed) return;
+
+        this._disposeAllTerms();
+        this.sessions = [];
+        this.activeSessionId = null;
+        this._buffers = {};
+        this._cachedCount = 0;
+        this._preferredSessionId = null;
+    },
+
+    _upsertSession(rawSession) {
+        const session = normalizeSession(rawSession);
+        if (!session) return null;
+
+        const view = {
+            id: session.id,
+            name: session.name,
+            type: session.type,
+            cwd: session.cwd,
+        };
+
+        const existingIndex = this.sessions.findIndex((current) => current.id === session.id);
+        if (existingIndex === -1) {
+            this.sessions = [...this.sessions, view].sort((left, right) => left.id - right.id);
+        } else {
+            const nextSessions = [...this.sessions];
+            nextSessions[existingIndex] = view;
+            this.sessions = nextSessions;
+        }
+
+        this._buffers[session.id] = mergeBuffer(this._buffers[session.id], session.buffer);
+        this._cachedCount = this.sessions.length;
+        return view;
+    },
+
+    _removeSession(sessionId) {
+        const normalizedId = Number(sessionId);
+        if (!Number.isInteger(normalizedId)) return;
+
+        const exists = this.sessions.some((session) => session.id === normalizedId);
+        if (!exists) return;
+
+        this._disposeTerm(normalizedId);
+        delete this._buffers[normalizedId];
+        this.sessions = this.sessions.filter((session) => session.id !== normalizedId);
+        this._cachedCount = this.sessions.length;
+
+        if (this.activeSessionId !== normalizedId) return;
+
+        const nextActiveId = this.sessions[0]?.id ?? null;
+        this.activeSessionId = nextActiveId;
+        this._preferredSessionId = nextActiveId;
+
+        if (nextActiveId !== null && this.panelOpen) {
+            void this._activate(nextActiveId);
+        }
+    },
 
     _appendBuffer(sessionId, output) {
         if (!output) return;
-        const prev = this._buffers[sessionId] || "";
-        this._buffers[sessionId] = (prev + output).slice(-BUFFER_LIMIT);
-    },
 
-    _pruneBuffers() {
-        const active = new Set(this.sessions.map((s) => String(s.id)));
-        for (const k of Object.keys(this._buffers)) {
-            if (!active.has(k)) delete this._buffers[k];
-        }
+        const previous = this._buffers[sessionId] || "";
+        this._buffers[sessionId] = (previous + output).slice(-BUFFER_LIMIT);
     },
-
-    // ── term disposal ──
 
     _disposeTerm(sessionId) {
-        if (this._inputTimers[sessionId] != null) {
-            clearTimeout(this._inputTimers[sessionId]);
-            delete this._inputTimers[sessionId];
-        }
-        delete this._inputQueues[sessionId];
+        const entry = this._terms[sessionId];
+        if (!entry) return;
 
-        const e = this._terms[sessionId];
-        if (!e) return;
-        e.resizeObserver?.disconnect();
-        e.term?.dispose();
+        entry.resizeObserver?.disconnect();
+        entry.term?.dispose();
         delete this._terms[sessionId];
     },
 
     _disposeAllTerms() {
-        for (const id of Object.keys(this._inputTimers)) clearTimeout(this._inputTimers[id]);
-        this._inputTimers = {};
-        this._inputQueues = {};
-        for (const id of Object.keys(this._terms)) this._disposeTerm(Number(id));
-    },
-
-    // ── config ──
-
-    async _loadConfig(force = false) {
-        if (this._configLoaded && !force) return;
-        try {
-            const res = await callJsonApi("plugins", {
-                action: "get_config", plugin_name: PLUGIN_NAME, project_name: "", agent_profile: "",
-            });
-            this.config = this._normalizeConfig(res?.data);
-        } catch (_) {
-            this.config = { ...DEFAULT_CONFIG };
+        for (const sessionId of Object.keys(this._terms)) {
+            this._disposeTerm(Number(sessionId));
         }
-        this._configLoaded = true;
-        if (!this._panelHeightCustom) this.panelHeight = vhToPx(this.config.default_panel_height_vh);
     },
 
-    _normalizeConfig(raw = {}) {
-        const c = raw && typeof raw === "object" ? raw : {};
-        const fs = Number(c.font_size);
-        const vh = Number(c.default_panel_height_vh);
+    _getCreatePayload() {
+        const activeTerm = this.activeSessionId !== null ? this._terms[this.activeSessionId] : null;
         return {
-            startup_directory: typeof c.startup_directory === "string" ? c.startup_directory : DEFAULT_CONFIG.startup_directory,
-            preserve_sessions_on_hide: c.preserve_sessions_on_hide !== false,
-            font_size: Number.isFinite(fs) ? Math.min(24, Math.max(10, Math.round(fs))) : DEFAULT_CONFIG.font_size,
-            cursor_blink: c.cursor_blink !== false,
-            default_panel_height_vh: Number.isFinite(vh) ? Math.min(MAX_VH * 100, Math.max(20, Math.round(vh))) : DEFAULT_CONFIG.default_panel_height_vh,
+            cols: activeTerm?.term?.cols || DEFAULT_COLS,
+            rows: activeTerm?.term?.rows || DEFAULT_ROWS,
         };
     },
 
-    // ── resize drag ──
+    async _loadConfig(force = false) {
+        if (this._configLoaded && !force) return;
+
+        try {
+            const response = await callJsonApi("plugins", {
+                action: "get_config",
+                plugin_name: PLUGIN_NAME,
+                project_name: "",
+                agent_profile: "",
+            });
+            this.config = this._normalizeConfig(response?.data);
+        } catch (_) {
+            this.config = { ...DEFAULT_CONFIG };
+        }
+
+        this._configLoaded = true;
+        if (!this._panelHeightCustom) {
+            this.panelHeight = vhToPx(this.config.default_panel_height_vh);
+        }
+    },
+
+    _normalizeConfig(raw = {}) {
+        const config = raw && typeof raw === "object" ? raw : {};
+        const fontSize = Number(config.font_size);
+        const defaultPanelHeight = Number(config.default_panel_height_vh);
+
+        return {
+            startup_directory: typeof config.startup_directory === "string"
+                ? config.startup_directory
+                : DEFAULT_CONFIG.startup_directory,
+            preserve_sessions_on_hide: config.preserve_sessions_on_hide !== false,
+            font_size: Number.isFinite(fontSize)
+                ? Math.min(24, Math.max(10, Math.round(fontSize)))
+                : DEFAULT_CONFIG.font_size,
+            cursor_blink: config.cursor_blink !== false,
+            default_panel_height_vh: Number.isFinite(defaultPanelHeight)
+                ? Math.min(MAX_VH * 100, Math.max(20, Math.round(defaultPanelHeight)))
+                : DEFAULT_CONFIG.default_panel_height_vh,
+        };
+    },
 
     _onDrag(event) {
         if (!this._resizing) return;
+
         const delta = this._resizeY - event.clientY;
         this._panelHeightCustom = true;
         this.panelHeight = clampHeight(this._resizeH + delta);
@@ -455,27 +723,30 @@ const model = {
 
     _endDrag() {
         if (!this._resizing) return;
+
         this._resizing = false;
-        if (this._boundMove) {
-            document.removeEventListener("mousemove", this._boundMove);
-            document.removeEventListener("mouseup", this._boundEnd);
-        }
+        if (!this._boundMove) return;
+
+        document.removeEventListener("mousemove", this._boundMove);
+        document.removeEventListener("mouseup", this._boundEnd);
     },
 
-    // ── internals ──
-
-    _resetState() {
+    _resetPanelState() {
         this.sessions = [];
         this.activeSessionId = null;
         this._terms = {};
-        this._inputQueues = {};
-        this._inputTimers = {};
-        this._pollId = null;
+        this._buffers = {};
         this._isCleaningUp = false;
+        this._subscribed = false;
     },
 
-    _api(action, payload = {}) {
-        return callJsonApi(TERMINAL_API, { action, ...payload });
+    async _request(eventType, payload = {}) {
+        const response = await SOCKET.request(eventType, payload);
+        return requestData(response);
+    },
+
+    async _emit(eventType, payload = {}) {
+        await SOCKET.emit(eventType, payload);
     },
 
     _err(message) {
