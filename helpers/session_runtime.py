@@ -16,11 +16,12 @@ import subprocess
 import termios
 import threading
 from concurrent.futures import Future
+from dataclasses import dataclass
 from typing import Any, Iterable
 
 from helpers import files, plugins, settings
 from helpers.defer import EventLoopThread
-from helpers.websocket_manager import send_data
+from helpers.websocket_manager import get_shared_websocket_manager
 import helpers.runtime as runtime
 
 import usr.plugins.docker_terminal.helpers.session_store as session_store
@@ -45,6 +46,12 @@ SESSIONS_CLEARED_EVENT = "docker_terminal_sessions_cleared"
 
 _OUTPUT_LOOP: EventLoopThread | None = None
 _OUTPUT_LOOP_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedTerminalPaths:
+    exec_cwd: str | None
+    display_cwd: str | None
 
 
 class RawLocalSession:
@@ -275,6 +282,14 @@ class RawLocalSession:
 
 
 def resolve_terminal_cwd() -> str | None:
+    return resolve_terminal_paths().display_cwd
+
+
+def resolve_terminal_paths(cwd: Any = None) -> ResolvedTerminalPaths:
+    requested = _normalize_terminal_path(cwd)
+    if requested.exec_cwd or requested.display_cwd:
+        return requested
+
     config = plugins.get_plugin_config(
         PLUGIN_NAME,
         agent=None,
@@ -282,14 +297,14 @@ def resolve_terminal_cwd() -> str | None:
         agent_profile="",
     )
     if isinstance(config, dict):
-        configured = _normalize_configured_path(config.get("startup_directory"))
-        if configured:
+        configured = _normalize_terminal_path(config.get("startup_directory"))
+        if configured.exec_cwd or configured.display_cwd:
             return configured
 
     path = settings.get_settings().get("workdir_path")
     if not path:
-        return None
-    return files.normalize_a0_path(path)
+        return ResolvedTerminalPaths(exec_cwd=None, display_cwd=None)
+    return _normalize_terminal_path(path)
 
 
 def create_terminal_session(
@@ -297,20 +312,20 @@ def create_terminal_session(
     cols: int = DEFAULT_COLS,
     rows: int = DEFAULT_ROWS,
 ) -> dict[str, Any]:
-    resolved_cwd = cwd or resolve_terminal_cwd()
+    resolved_paths = resolve_terminal_paths(cwd)
     session_id = session_store.next_session_id()
-    session = RawLocalSession(cwd=resolved_cwd)
+    session = RawLocalSession(cwd=resolved_paths.exec_cwd)
 
     try:
-        if resolved_cwd:
-            os.makedirs(resolved_cwd, exist_ok=True)
+        _prepare_terminal_cwd(resolved_paths.exec_cwd)
         session.connect()
         session_store.add_session(
             session_id,
             {
                 "id": session_id,
                 "session": session,
-                "cwd": resolved_cwd or "~",
+                "cwd": resolved_paths.display_cwd or "~",
+                "exec_cwd": resolved_paths.exec_cwd,
                 "type": "local",
             },
         )
@@ -322,7 +337,14 @@ def create_terminal_session(
     except Exception as error:
         session_store.remove_session(session_id)
         session.force_close()
-        return {"ok": False, "error": str(error)}
+        return {
+            "ok": False,
+            "error": _format_terminal_start_error(
+                error,
+                exec_cwd=resolved_paths.exec_cwd,
+                display_cwd=resolved_paths.display_cwd,
+            ),
+        }
 
     snapshot = session_store.snapshot_session(session_id, include_buffer=True)
     if snapshot is None:
@@ -434,14 +456,76 @@ def resize_terminal_session(
         return {"ok": False, "error": str(error)}
 
 
-def _normalize_configured_path(path: Any) -> str | None:
+def _normalize_terminal_path(path: Any) -> ResolvedTerminalPaths:
     raw_path = str(path or "").strip()
     if not raw_path:
-        return None
+        return ResolvedTerminalPaths(exec_cwd=None, display_cwd=None)
 
-    absolute_path = files.get_abs_path(raw_path)
-    development_path = files.fix_dev_path(absolute_path)
-    return files.normalize_a0_path(development_path)
+    expanded_path = os.path.expanduser(raw_path)
+    exec_cwd = _resolve_exec_cwd(expanded_path)
+    display_cwd = _resolve_display_cwd(exec_cwd, raw_path, expanded_path)
+    return ResolvedTerminalPaths(exec_cwd=exec_cwd, display_cwd=display_cwd)
+
+
+def _resolve_exec_cwd(path: str) -> str:
+    if path.startswith("/a0/"):
+        return files.fix_dev_path(path)
+    if os.path.isabs(path):
+        return path
+    return files.get_abs_path(path)
+
+
+def _resolve_display_cwd(
+    exec_cwd: str | None,
+    raw_path: str,
+    expanded_path: str,
+) -> str | None:
+    if not exec_cwd:
+        return None
+    if raw_path.startswith("/a0/"):
+        return files.normalize_a0_path(exec_cwd)
+    if os.path.isabs(expanded_path):
+        return expanded_path
+    return files.normalize_a0_path(exec_cwd)
+
+
+def _prepare_terminal_cwd(exec_cwd: str | None) -> None:
+    if not exec_cwd:
+        return
+
+    if os.path.exists(exec_cwd):
+        if not os.path.isdir(exec_cwd):
+            raise NotADirectoryError(exec_cwd)
+        return
+
+    os.makedirs(exec_cwd, exist_ok=True)
+
+
+def _describe_terminal_cwd(exec_cwd: str | None, display_cwd: str | None) -> str:
+    if display_cwd and exec_cwd and display_cwd != exec_cwd:
+        return f"{display_cwd} (resolved to {exec_cwd})"
+    return display_cwd or exec_cwd or "the requested startup directory"
+
+
+def _format_terminal_start_error(
+    error: Exception,
+    *,
+    exec_cwd: str | None,
+    display_cwd: str | None,
+) -> str:
+    target = _describe_terminal_cwd(exec_cwd, display_cwd)
+
+    if isinstance(error, NotADirectoryError):
+        return f"Failed to start terminal: startup directory is not a folder: {target}"
+    if isinstance(error, FileNotFoundError):
+        return f"Failed to start terminal: startup directory is unavailable: {target}"
+    if isinstance(error, PermissionError):
+        return f"Failed to start terminal: startup directory is not accessible: {target}"
+    if isinstance(error, OSError) and error.errno == errno.EROFS:
+        return f"Failed to start terminal: startup directory is read-only: {target}"
+    if exec_cwd or display_cwd:
+        return f"Failed to start terminal in {target}: {error}"
+    return str(error)
 
 
 def _handle_session_output(session_id: int, output: str) -> None:
@@ -501,13 +585,14 @@ async def _push_to_subscribers(
     event_name: str,
     data: dict[str, Any],
 ) -> None:
+    manager = get_shared_websocket_manager()
     stale: list[str] = []
     for sid in subscribers:
         try:
-            await send_data(
+            await manager.send_data(
+                endpoint_name="/webui",
                 event_name=event_name,
                 data=data,
-                endpoint_name="/webui",
                 connection_id=sid,
             )
         except Exception:

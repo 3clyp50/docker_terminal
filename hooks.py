@@ -1,42 +1,24 @@
+# -*- coding: utf-8 -*-
+"""Install/update hooks for docker_terminal."""
+
 from __future__ import annotations
 
 import importlib
+import shutil
 import sys
-
-from helpers.extension import Extension
+from pathlib import Path
 
 
 PLUGIN_PACKAGE_PREFIX = "usr.plugins.docker_terminal"
 RUNTIME_MODULE_NAME = f"{PLUGIN_PACKAGE_PREFIX}.helpers.session_runtime"
 SESSION_STORE_MODULE_NAME = f"{PLUGIN_PACKAGE_PREFIX}.helpers.session_store"
+PLUGIN_ROOT = Path(__file__).resolve().parent
 
 
-def _load_runtime_module():
-    last_error: Exception | None = None
-
-    for attempt in range(2):
-        try:
-            module = importlib.import_module(RUNTIME_MODULE_NAME)
-        except Exception as error:
-            last_error = error
-        else:
-            if hasattr(module, "remove_terminal_client"):
-                return module
-            last_error = ImportError(
-                "docker_terminal runtime is stale or incomplete: missing remove_terminal_client"
-            )
-
-        if attempt == 0:
-            _repair_stale_plugin_runtime()
-
-    if last_error is not None:
-        raise last_error
-    raise RuntimeError("Failed to load docker_terminal runtime")
-
-
-def _repair_stale_plugin_runtime() -> None:
+def install():
     _close_loaded_terminal_sessions()
     _clear_plugin_modules()
+    _clear_plugin_bytecode()
 
 
 def _close_loaded_terminal_sessions() -> None:
@@ -97,8 +79,6 @@ def _clear_plugin_modules() -> None:
     importlib.invalidate_caches()
 
 
-class TerminalWebSocketDisconnect(Extension):
-    async def execute(self, sid: str = "", **kwargs):
-        del kwargs
-        runtime = _load_runtime_module()
-        runtime.remove_terminal_client(sid)
+def _clear_plugin_bytecode() -> None:
+    for cache_dir in PLUGIN_ROOT.rglob("__pycache__"):
+        shutil.rmtree(cache_dir, ignore_errors=True)
