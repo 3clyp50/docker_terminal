@@ -9,6 +9,7 @@ This plugin adds a terminal button to the chat input area and opens a docked ter
 - Open a terminal panel directly from the Agent Zero chat UI
 - Automatically create the first session when the panel opens
 - Run multiple terminal sessions with tab switching
+- Copy selected terminal text and paste clipboard content from dedicated panel controls
 - Resize the panel vertically from the UI
 - Keep sessions alive while the panel is hidden, or close them on hide
 - Configure startup directory, font size, cursor blink, and default panel height
@@ -25,8 +26,9 @@ After the plugin is enabled:
 2. Click the `Terminal` button near the chat input.
 3. The panel opens and creates a session automatically if none exist yet.
 4. Use the `+` tab button to create additional sessions.
-5. Use the close button on a tab to close a session.
-6. Collapse the panel with the arrow button when you want to hide it.
+5. Use the copy and paste buttons in the tab bar for clipboard operations (`Ctrl+Shift+C` and `Ctrl+Shift+V` are also supported).
+6. Use the close button on a tab to close a session.
+7. Collapse the panel with the arrow button when you want to hide it.
 
 ## Configuration
 

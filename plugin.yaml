@@ -1,7 +1,7 @@
 name: docker_terminal
 title: Docker Terminal
 description: Interactive terminal access to the Docker container directly from the Agent Zero UI. Supports multiple sessions with tab switching.
-version: 1.2.2
+version: 1.2.3
 settings_sections:
  - developer
 per_project_config: false

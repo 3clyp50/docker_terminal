@@ -33,6 +33,18 @@
                         <span class="material-symbols-outlined">add</span>
                     </button>
 
+                    <button class="dtp-tab dtp-tab-action"
+                            @click="$store.dockerTerminal.copySelection()"
+                            title="Copy selected terminal text (Ctrl+Shift+C)">
+                        <span class="material-symbols-outlined">content_copy</span>
+                    </button>
+
+                    <button class="dtp-tab dtp-tab-action"
+                            @click="$store.dockerTerminal.pasteFromClipboard()"
+                            title="Paste clipboard into terminal (Ctrl+Shift+V)">
+                        <span class="material-symbols-outlined">content_paste</span>
+                    </button>
+
                     <button class="dtp-tab dtp-tab-collapse"
                             @click="$store.dockerTerminal.togglePanel()"
                             title="Hide terminal panel">
@@ -127,6 +139,7 @@
         }
 
         .dtp-tab-new,
+        .dtp-tab-action,
         .dtp-tab-collapse {
             min-width: auto;
             padding: var(--spacing-xs);
@@ -134,6 +147,7 @@
         }
 
         .dtp-tab-new .material-symbols-outlined,
+        .dtp-tab-action .material-symbols-outlined,
         .dtp-tab-collapse .material-symbols-outlined {
             font-size: 18px;
         }

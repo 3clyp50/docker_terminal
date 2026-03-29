@@ -16,6 +16,7 @@ const MAX_VH = 0.6;
 const DEFAULT_VH = 0.4;
 const DEFAULT_COLS = 120;
 const DEFAULT_ROWS = 40;
+const IS_MAC = typeof navigator !== "undefined" && /\bMac|iPhone|iPad|iPod\b/.test(navigator.platform || "");
 
 const EVENT = Object.freeze({
     subscribe: "docker_terminal_subscribe",
@@ -291,6 +292,47 @@ const model = {
         }
     },
 
+    async copySelection() {
+        if (this.activeSessionId === null) return false;
+        const entry = this._terms[this.activeSessionId];
+        const selection = entry?.term?.getSelection?.() || "";
+        if (!selection) return false;
+
+        if (!navigator?.clipboard?.writeText) {
+            this._err("Clipboard copy is unavailable in this browser context.");
+            return false;
+        }
+
+        try {
+            await navigator.clipboard.writeText(selection);
+            return true;
+        } catch (error) {
+            this._err(errMsg(error, "Failed to copy terminal selection."));
+            return false;
+        }
+    },
+
+    async pasteFromClipboard() {
+        const sessionId = this.activeSessionId;
+        if (sessionId === null) return false;
+
+        if (!navigator?.clipboard?.readText) {
+            this._err("Clipboard paste is unavailable in this browser context.");
+            return false;
+        }
+
+        let text = "";
+        try {
+            text = await navigator.clipboard.readText();
+        } catch (error) {
+            this._err(errMsg(error, "Failed to read clipboard."));
+            return false;
+        }
+
+        if (!text) return true;
+        return this._sendInput(sessionId, text);
+    },
+
     async closeSession(sessionId) {
         try {
             await this._request(EVENT.close, { session_id: sessionId });
@@ -380,17 +422,20 @@ const model = {
         const fitAddon = new W.FitAddon.FitAddon();
         term.loadAddon(fitAddon);
         term.open(element);
+        term.attachCustomKeyEventHandler((event) => this._handleClipboardShortcut(sessionId, event));
 
         const buffer = this._buffers[sessionId];
         if (buffer) term.write(buffer);
 
         term.onData((data) => {
-            if (!this.panelOpen || !this._subscribed || !this._socketConnected) return;
-            void this._emit(EVENT.input, { session_id: sessionId, data }).catch((error) => {
-                if (!this._isCleaningUp && this.panelOpen) {
-                    this._err(errMsg(error, "Failed to send input."));
-                }
-            });
+            void this._sendInput(sessionId, data, { notifyOnDisconnect: false });
+        });
+
+        term.textarea?.addEventListener("paste", (event) => {
+            const text = event.clipboardData?.getData("text") || "";
+            if (!text) return;
+            event.preventDefault();
+            void this._sendInput(sessionId, text);
         });
 
         element.addEventListener("mousedown", () => this._focusTerm(sessionId));
@@ -649,6 +694,44 @@ const model = {
         this._buffers[sessionId] = (previous + output).slice(-BUFFER_LIMIT);
     },
 
+    _isCopyShortcut(event) {
+        if (event.altKey) return false;
+
+        const key = String(event.key || "").toLowerCase();
+        const mod = IS_MAC ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
+        if (mod && event.shiftKey && key === "c") return true;
+        return !IS_MAC && event.ctrlKey && !event.shiftKey && key === "insert";
+    },
+
+    _isPasteShortcut(event) {
+        if (event.altKey) return false;
+
+        const key = String(event.key || "").toLowerCase();
+        const mod = IS_MAC ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
+        if (mod && event.shiftKey && key === "v") return true;
+        return !IS_MAC && event.shiftKey && key === "insert";
+    },
+
+    _handleClipboardShortcut(sessionId, event) {
+        if (event.type !== "keydown") return true;
+
+        if (this._isCopyShortcut(event)) {
+            if (!navigator?.clipboard?.writeText) return true;
+            event.preventDefault();
+            if (sessionId === this.activeSessionId) void this.copySelection();
+            return false;
+        }
+
+        if (this._isPasteShortcut(event)) {
+            if (!navigator?.clipboard?.readText) return true;
+            event.preventDefault();
+            if (sessionId === this.activeSessionId) void this.pasteFromClipboard();
+            return false;
+        }
+
+        return true;
+    },
+
     _disposeTerm(sessionId) {
         const entry = this._terms[sessionId];
         if (!entry) return;
@@ -747,6 +830,26 @@ const model = {
 
     async _emit(eventType, payload = {}) {
         await SOCKET.emit(eventType, payload);
+    },
+
+    async _sendInput(sessionId, data, { notifyOnDisconnect = true } = {}) {
+        if (!data) return true;
+        if (!this.panelOpen || !this._subscribed || !this._socketConnected) {
+            if (notifyOnDisconnect && this.panelOpen && !this._isCleaningUp) {
+                this._err("Terminal is disconnected.");
+            }
+            return false;
+        }
+
+        try {
+            await this._emit(EVENT.input, { session_id: sessionId, data });
+            return true;
+        } catch (error) {
+            if (!this._isCleaningUp && this.panelOpen) {
+                this._err(errMsg(error, "Failed to send input."));
+            }
+            return false;
+        }
     },
 
     _err(message) {
