@@ -4,7 +4,16 @@ import { getNamespacedClient } from "/js/websocket.js";
 import { store as notificationStore } from "/components/notifications/notification-store.js";
 
 const PLUGIN_NAME = "docker_terminal";
-const SOCKET = getNamespacedClient("/webui");
+let _socket = null;
+
+function getSocket() {
+    if (_socket) return _socket;
+    // New A0 system uses unified /ws; legacy uses /webui.
+    // By first-use time, the core app will have initialized its /ws client.
+    const ws = getNamespacedClient("/ws");
+    _socket = ws.socket ? ws : getNamespacedClient("/webui");
+    return _socket;
+}
 
 const XTERM_CSS = "https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css";
 const XTERM_JS = "https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js";
@@ -500,23 +509,23 @@ const model = {
         };
 
         await Promise.all([
-            SOCKET.on(EVENT.output, this._socketHandlers.output),
-            SOCKET.on(EVENT.sessionCreated, this._socketHandlers.sessionCreated),
-            SOCKET.on(EVENT.sessionClosed, this._socketHandlers.sessionClosed),
-            SOCKET.on(EVENT.sessionsCleared, this._socketHandlers.sessionsCleared),
+            getSocket().on(EVENT.output, this._socketHandlers.output),
+            getSocket().on(EVENT.sessionCreated, this._socketHandlers.sessionCreated),
+            getSocket().on(EVENT.sessionClosed, this._socketHandlers.sessionClosed),
+            getSocket().on(EVENT.sessionsCleared, this._socketHandlers.sessionsCleared),
         ]);
 
-        this._socketConnected = SOCKET.isConnected();
+        this._socketConnected = getSocket().isConnected();
         this._socketEventsBound = true;
     },
 
     _unbindSocketEvents() {
         if (!this._socketEventsBound || !this._socketHandlers) return;
 
-        SOCKET.off(EVENT.output, this._socketHandlers.output);
-        SOCKET.off(EVENT.sessionCreated, this._socketHandlers.sessionCreated);
-        SOCKET.off(EVENT.sessionClosed, this._socketHandlers.sessionClosed);
-        SOCKET.off(EVENT.sessionsCleared, this._socketHandlers.sessionsCleared);
+        getSocket().off(EVENT.output, this._socketHandlers.output);
+        getSocket().off(EVENT.sessionCreated, this._socketHandlers.sessionCreated);
+        getSocket().off(EVENT.sessionClosed, this._socketHandlers.sessionClosed);
+        getSocket().off(EVENT.sessionsCleared, this._socketHandlers.sessionsCleared);
 
         this._socketHandlers = null;
         this._socketEventsBound = false;
@@ -526,20 +535,20 @@ const model = {
         if (this._socketLifecycleBound) return;
 
         this._socketLifecycleBound = true;
-        this._socketConnected = SOCKET.isConnected();
+        this._socketConnected = getSocket().isConnected();
 
-        SOCKET.onConnect(() => {
+        getSocket().onConnect(() => {
             this._socketConnected = true;
             if (this.panelOpen && this._subscribed) {
                 void this._subscribeSessions({ refreshTerms: true });
             }
         });
 
-        SOCKET.onDisconnect(() => {
+        getSocket().onDisconnect(() => {
             this._socketConnected = false;
         });
 
-        SOCKET.onError((error) => {
+        getSocket().onError((error) => {
             if (!this.panelOpen || this._isCleaningUp) return;
             this._err(errMsg(error, "Terminal websocket error."));
         });
@@ -824,12 +833,12 @@ const model = {
     },
 
     async _request(eventType, payload = {}) {
-        const response = await SOCKET.request(eventType, payload);
+        const response = await getSocket().request(eventType, payload);
         return requestData(response);
     },
 
     async _emit(eventType, payload = {}) {
-        await SOCKET.emit(eventType, payload);
+        await getSocket().emit(eventType, payload);
     },
 
     async _sendInput(sessionId, data, { notifyOnDisconnect = true } = {}) {

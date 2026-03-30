@@ -21,8 +21,23 @@ from typing import Any, Iterable
 
 from helpers import files, plugins, settings
 from helpers.defer import EventLoopThread
-from helpers.websocket_manager import get_shared_websocket_manager
 import helpers.runtime as runtime
+
+try:
+    from helpers.ws_manager import get_shared_ws_manager
+
+    WS_MGS_SEND_DATA_EVENT = "event_type"
+except ImportError:
+    from helpers.websocket_manager import (  # type: ignore
+        get_shared_websocket_manager as get_shared_ws_manager,
+    )
+
+    WS_MGS_SEND_DATA_EVENT = "event_name"
+
+try:
+    from helpers.ws import NAMESPACE as _WS_NAMESPACE
+except ImportError:
+    _WS_NAMESPACE = "/webui"
 
 import usr.plugins.docker_terminal.helpers.session_store as session_store
 
@@ -585,13 +600,13 @@ async def _push_to_subscribers(
     event_name: str,
     data: dict[str, Any],
 ) -> None:
-    manager = get_shared_websocket_manager()
+    manager = get_shared_ws_manager()
     stale: list[str] = []
     for sid in subscribers:
         try:
             await manager.send_data(
-                endpoint_name="/webui",
-                event_name=event_name,
+                endpoint_name=_WS_NAMESPACE,
+                **{WS_MGS_SEND_DATA_EVENT: event_name},
                 data=data,
                 connection_id=sid,
             )
