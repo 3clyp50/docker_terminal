@@ -21,7 +21,6 @@
           </template>
           <div class="dtw-start" x-show="!$store.dockerTerminal.panelOpen">
             <x-icon name="terminal"></x-icon>
-            <p>Your runtime, one command away.</p>
             <button type="button" class="button" :disabled="$store.dockerTerminal.loading" @click="$store.dockerTerminal.togglePanel()">Open terminal<x-icon name="arrow_forward"></x-icon></button>
           </div>
         </section>
@@ -35,7 +34,6 @@
     .dtw-card .dtp-panel { border-top: 1px solid var(--color-border); }
     .dtw-start { display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 0.75rem; min-height: 17rem; padding: 1rem; border-top: 1px solid var(--color-border); text-align: center; }
     .dtw-start > x-icon { font-size: 2rem; color: var(--color-text-muted); }
-    .dtw-start p { color: var(--color-text-muted); margin: 0; font-size: 0.9rem; }
     .dtw-start button { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.5rem; }
     .dtw-start button x-icon { font-size: 1.1rem; }
     @media (pointer: coarse) { .dtw-card .welcome-panel-icon-button { min-width: 36px; min-height: 44px; } }
