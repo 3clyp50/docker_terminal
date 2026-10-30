@@ -13,8 +13,8 @@
                     <template x-for="session in $store.dockerTerminal.sessions" :key="session.id">
                         <div class="dtp-tab" role="tab" tabindex="0"
                              :aria-selected="$store.dockerTerminal.activeSessionId === session.id"
-                             @keydown.enter="$store.dockerTerminal.switchSession(session.id)"
-                             @keydown.space.prevent="$store.dockerTerminal.switchSession(session.id)"
+                             @keydown.enter.self="$store.dockerTerminal.switchSession(session.id)"
+                             @keydown.space.self.prevent="$store.dockerTerminal.switchSession(session.id)"
                              :class="{ 'active': $store.dockerTerminal.activeSessionId === session.id }"
                              @click="$store.dockerTerminal.switchSession(session.id)">
                             <span class="dtp-tab-icon">▶</span>
