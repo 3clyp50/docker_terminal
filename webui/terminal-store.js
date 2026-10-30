@@ -1,10 +1,13 @@
-import { createStore } from "/js/AlpineStore.js";
+import { createStore, getStore } from "/js/AlpineStore.js";
 import { callJsonApi } from "/js/api.js";
 import { getNamespacedClient } from "/js/websocket.js";
 import { store as notificationStore } from "/components/notifications/notification-store.js";
 
 const PLUGIN_NAME = "docker_terminal";
 let _socket = null;
+let panelHost = null;
+let panelGeneration = 0;
+let panelWork = Promise.resolve();
 
 function getSocket() {
     if (_socket) return _socket;
@@ -163,6 +166,9 @@ function requestData(response) {
 
 const model = {
     panelOpen: false,
+    welcomeMounted: false,
+    welcomeWide: true,
+    _focusOnOpen: false,
     panelHeight: Math.round(innerHeight * DEFAULT_VH),
     sessions: [],
     activeSessionId: null,
@@ -219,36 +225,80 @@ const model = {
     },
 
     async togglePanel() {
-        if (this.panelOpen) {
-            this._isCleaningUp = true;
-            this._endDrag();
-            this.panelOpen = false;
-            return;
-        }
-        if (this.loading) return;
-
-        await this._loadConfig(true);
-        this.panelOpen = true;
-        this.loading = true;
-
-        try {
-            await afterPaint();
-            await this._openPanel();
-        } catch (error) {
-            this.panelOpen = false;
-            this.cleanup();
-            this._err(errMsg(error, "Failed to open the terminal."));
-        } finally {
-            this.loading = false;
-        }
+        if (this.loading && !this.panelOpen) return;
+        this._focusOnOpen = !this.panelOpen;
+        this.panelOpen = !this.panelOpen;
     },
 
-    async _openPanel() {
+    mountPanel(element) {
+        if (panelHost && panelHost !== element) this.unmountPanel(panelHost);
+        panelHost = element;
+        const generation = ++panelGeneration;
+        this.loading = true;
+        panelWork = panelWork.then(async () => {
+            if (generation !== panelGeneration) return;
+            await this._loadConfig(true);
+            await afterPaint();
+            if (generation !== panelGeneration || !this.panelOpen) return;
+            await this._openPanel(generation);
+        }).catch((error) => {
+            if (generation !== panelGeneration) return;
+            this.panelOpen = false;
+            this._err(errMsg(error, "Failed to open the terminal."));
+        }).finally(() => {
+            if (generation === panelGeneration) this.loading = false;
+        });
+        return panelWork;
+    },
+
+    unmountPanel(element) {
+        if (panelHost !== element) return;
+        panelHost = null;
+        panelGeneration++;
+        this.loading = false;
+        this._isCleaningUp = true;
+        this._endDrag();
+        panelWork = panelWork.then(() => this.cleanup());
+        return panelWork;
+    },
+
+    mountWelcome() {
+        this.welcomeMounted = true;
+        const welcome = getStore("welcomeStore");
+        welcome.init();
+        try {
+            this.welcomeWide = localStorage.getItem("dockerTerminal.welcomeWide") !== "false";
+            if (localStorage.getItem("welcome_hidden_docker_terminal.terminal") === "true") {
+                welcome.dismissSection("docker_terminal.terminal");
+            }
+        } catch (error) { console.warn("Could not restore terminal layout", error); }
+    },
+
+    unmountWelcome() { this.welcomeMounted = false; },
+
+    dismissWelcome() {
+        this.panelOpen = false;
+        getStore("welcomeStore").dismissSection("docker_terminal.terminal");
+    },
+
+    toggleWelcomeWidth() {
+        this.welcomeWide = !this.welcomeWide;
+        try { localStorage.setItem("dockerTerminal.welcomeWide", String(this.welcomeWide)); }
+        catch (error) { console.warn(error); }
+    },
+
+    async _openPanel(generation) {
+        const current = () => generation === panelGeneration && panelHost?.isConnected && this.panelOpen;
         await this._loadXterm();
+        if (!current()) return;
+        const focus = this._focusOnOpen;
+        this._focusOnOpen = false;
         this._resetPanelState();
         this._bindSocketLifecycle();
         await this._bindSocketEvents();
+        if (!current()) return;
         await this._subscribeSessions({ refreshTerms: false });
+        if (!current()) return;
         if (!this.panelOpen || !this._subscribed) return;
 
         if (this.sessions.length === 0) {
@@ -262,7 +312,7 @@ const model = {
             this.activeSessionId,
         );
         if (targetId !== null) {
-            await this._activate(targetId);
+            await this._activate(targetId, focus);
         }
     },
 
@@ -362,7 +412,7 @@ const model = {
     },
 
     cleanup() {
-        const preserve = this.config.preserve_sessions_on_hide !== false;
+        const preserve = this.panelOpen || this.config.preserve_sessions_on_hide !== false;
         const cachedCount = preserve ? this.sessions.length : 0;
         const preferredSessionId = preserve ? this.activeSessionId : null;
         const unsubscribePromise = this._subscribed ? this._unsubscribeSessions() : null;
@@ -376,15 +426,16 @@ const model = {
         this._disposeAllTerms();
         this._resetPanelState();
 
-        if (unsubscribePromise) void unsubscribePromise;
+        const pending = unsubscribePromise ? [unsubscribePromise] : [];
 
         if (!preserve) {
             this._cachedCount = 0;
             this._preferredSessionId = null;
-            void this._request(EVENT.closeAll).catch((error) => {
+            pending.push(this._request(EVENT.closeAll).catch((error) => {
                 this._err(errMsg(error, "Failed to close sessions."));
-            });
+            }));
         }
+        return Promise.all(pending);
     },
 
     async _loadXterm() {
@@ -415,7 +466,8 @@ const model = {
     },
 
     _ensureTerm(sessionId) {
-        if (this._terms[sessionId]) return this._terms[sessionId];
+        if (this._terms[sessionId]?.element.isConnected) return this._terms[sessionId];
+        if (this._terms[sessionId]) this._disposeTerm(sessionId);
         if (!W.Terminal || !W.FitAddon) return null;
 
         const element = document.getElementById(`terminal-${sessionId}`);
@@ -481,7 +533,7 @@ const model = {
         if (entry) requestAnimationFrame(() => entry.term.focus());
     },
 
-    async _activate(sessionId) {
+    async _activate(sessionId, focus = true) {
         const normalizedId = Number(sessionId);
         if (!Number.isInteger(normalizedId) || !this.panelOpen) return;
 
@@ -495,7 +547,7 @@ const model = {
         if (!entry) return;
 
         this._fitResize(normalizedId);
-        this._focusTerm(normalizedId);
+        if (focus) this._focusTerm(normalizedId);
     },
 
     async _bindSocketEvents() {
@@ -603,7 +655,7 @@ const model = {
         this._preferredSessionId = nextActiveId;
 
         if (nextActiveId !== null && this.panelOpen) {
-            await this._activate(nextActiveId);
+            await this._activate(nextActiveId, false);
         }
     },
 
@@ -843,7 +895,7 @@ const model = {
 
     async _sendInput(sessionId, data, { notifyOnDisconnect = true } = {}) {
         if (!data) return true;
-        if (!this.panelOpen || !this._subscribed || !this._socketConnected) {
+        if (!this.panelOpen || !panelHost?.isConnected || this._isCleaningUp || !this._subscribed || !this._socketConnected) {
             if (notifyOnDisconnect && this.panelOpen && !this._isCleaningUp) {
                 this._err("Terminal is disconnected.");
             }

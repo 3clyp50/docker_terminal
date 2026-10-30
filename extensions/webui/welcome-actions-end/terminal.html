@@ -1,0 +1,45 @@
+<html>
+<head><script type="module" src="/plugins/docker_terminal/webui/terminal-store.js"></script></head>
+<body>
+  <div x-data>
+    <template x-if="$store.dockerTerminal && document.querySelector('.welcome-board')">
+      <template x-teleport=".welcome-board">
+        <section class="dtw-card" data-welcome-block="docker_terminal.terminal" data-welcome-label="Terminal"
+          :data-welcome-size="$store.dockerTerminal.welcomeWide ? 'full' : 'half'"
+          x-show="!$store.welcomeStore.hiddenSections.includes('docker_terminal.terminal')"
+          x-create="$store.dockerTerminal.mountWelcome()" x-destroy="$store.dockerTerminal.unmountWelcome()">
+          <header class="welcome-panel-header">
+            <h2>Terminal</h2>
+            <div class="welcome-panel-actions">
+              <button type="button" class="welcome-panel-icon-button" :aria-label="$store.dockerTerminal.welcomeWide ? 'Use half-width terminal panel' : 'Expand terminal panel'" @click="$store.dockerTerminal.toggleWelcomeWidth()"><x-icon :name="$store.dockerTerminal.welcomeWide ? 'close_fullscreen' : 'open_in_full'"></x-icon></button>
+              <button type="button" data-welcome-handle></button>
+              <button type="button" class="welcome-panel-icon-button" aria-label="Dismiss Terminal" @click="$store.dockerTerminal.dismissWelcome()"><x-icon name="close"></x-icon></button>
+            </div>
+          </header>
+          <template x-if="$store.dockerTerminal.panelOpen">
+            <x-component path="/plugins/docker_terminal/webui/terminal-view.html"></x-component>
+          </template>
+          <div class="dtw-start" x-show="!$store.dockerTerminal.panelOpen">
+            <x-icon name="terminal"></x-icon>
+            <p>Your runtime, one command away.</p>
+            <button type="button" class="button" :disabled="$store.dockerTerminal.loading" @click="$store.dockerTerminal.togglePanel()">Open terminal<x-icon name="arrow_forward"></x-icon></button>
+          </div>
+        </section>
+      </template>
+    </template>
+  </div>
+  <style>
+    .dtw-card { border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-panel); min-width: 0; overflow: hidden; }
+    .dtw-card > .welcome-panel-header { padding: 1.35rem; margin: 0; }
+    .dtw-card > x-component { display: contents; }
+    .dtw-card .dtp-panel { border-top: 1px solid var(--color-border); }
+    .dtw-start { display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 0.75rem; min-height: 17rem; padding: 1rem; border-top: 1px solid var(--color-border); text-align: center; }
+    .dtw-start > x-icon { font-size: 2rem; color: var(--color-text-muted); }
+    .dtw-start p { color: var(--color-text-muted); margin: 0; font-size: 0.9rem; }
+    .dtw-start button { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.5rem; }
+    .dtw-start button x-icon { font-size: 1.1rem; }
+    @media (pointer: coarse) { .dtw-card .welcome-panel-icon-button { min-width: 36px; min-height: 44px; } }
+    @media (max-width: 480px) { .dtw-card > .welcome-panel-header { padding: 1rem; } }
+  </style>
+</body>
+</html>

@@ -1,12 +1,20 @@
 # Docker Terminal
 
-Embedded multi-session terminal panel for Agent Zero.
+Embedded multi-session terminal for Agent Zero, in chat and on the welcome screen.
+
+![Docker Terminal](webui/thumbnail.webp)
 
 This plugin adds a terminal button to the chat input area and opens a docked terminal panel directly inside the Agent Zero UI. It supports multiple PTY-backed sessions, tab switching, live resize, persistent sessions while hidden, and a configurable startup directory across both Docker and local development runtimes.
 
+## Welcome panel
+
+On a welcome screen with movable blocks, Terminal appears as a full-width panel. Click **Open terminal** to connect; visiting Welcome alone does not start a shell. Use the header controls to switch to half width, drag the panel, or dismiss it. **Show all dismissed** restores it. Adjacent half-width panels share a row; an unpaired panel expands automatically.
+
+The welcome panel and chat panel share sessions and terminal controls. Moving the panel or switching between Welcome and chat preserves sessions, including when close-on-hide is enabled. Explicitly hiding the terminal still follows `preserve_sessions_on_hide`. On older Agent Zero versions, the original chat terminal remains available.
+
 ## Features
 
-- Open a terminal panel directly from the Agent Zero chat UI
+- Open a terminal panel directly from Welcome or the Agent Zero chat UI
 - Automatically create the first session when the panel opens
 - Run multiple terminal sessions with tab switching
 - Copy selected terminal text and paste clipboard content from dedicated panel controls
@@ -54,9 +62,13 @@ default_panel_height_vh: 40
 
 - The terminal runs inside the Agent Zero runtime environment, so it has access to the same filesystem and tools available to that runtime.
 - In Docker, `/a0/...` paths are used directly. In local development, `/a0/...` paths are resolved to the matching local checkout path for execution while still being shown as `/a0/...` in the UI when applicable.
-- Plugin installs and updates close existing terminal sessions, remove stale loaded plugin modules, and clean local bytecode caches so websocket reconnects can recover without an app restart.
+- Plugin installs, updates, and uninstall close plugin-owned terminal sessions. Installs and updates remove stale loaded plugin modules, and clean local bytecode caches so websocket reconnects can recover without an app restart.
 - The frontend loads `xterm.js` and `xterm-addon-fit` from jsDelivr CDN at runtime.
 - This plugin is designed for the Agent Zero plugin system and should live at the repository root when published as a standalone plugin repository.
+
+## Verification
+
+Run `node --test tests/welcome.test.mjs` for host handoff and loading cancellation checks. Live checks should include running a command, switching sessions, half/full width, reordering, dismissal/restoration, chat transitions, and both color themes.
 
 ## Repository Layout
 

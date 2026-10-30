@@ -21,6 +21,15 @@ def install():
     _clear_plugin_bytecode()
 
 
+def pre_update():
+    _close_loaded_terminal_sessions()
+
+
+def uninstall():
+    _close_loaded_terminal_sessions()
+    _clear_plugin_modules()
+
+
 def _close_loaded_terminal_sessions() -> None:
     runtime_module = sys.modules.get(RUNTIME_MODULE_NAME)
     close_all = getattr(runtime_module, "close_all_terminal_sessions", None)
