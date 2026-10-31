@@ -2,7 +2,7 @@
 
 Embedded multi-session terminal for Agent Zero, in chat and on the welcome screen.
 
-![Docker Terminal](webui/thumbnail.webp)
+![Docker Terminal](webui/thumbnail.png)
 
 This plugin adds a terminal button to the chat input area and opens a docked terminal panel directly inside the Agent Zero UI. It supports multiple PTY-backed sessions, tab switching, live resize, persistent sessions while hidden, and a configurable startup directory across both Docker and local development runtimes.
 
