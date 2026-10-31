@@ -28,11 +28,11 @@
     </template>
   </div>
   <style>
-    .dtw-card { border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-panel); min-width: 0; overflow: hidden; }
+    .dtw-card { display: flex; flex-direction: column; border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-panel); min-width: 0; overflow: hidden; }
     .dtw-card > .welcome-panel-header { padding: 1.35rem; margin: 0; }
     .dtw-card > x-component { display: contents; }
-    .dtw-card .dtp-panel { border-top: 1px solid var(--color-border); }
-    .dtw-start { display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 0.75rem; min-height: 17rem; padding: 1rem; border-top: 1px solid var(--color-border); text-align: center; }
+    .dtw-card .dtp-panel { flex: 1 0 auto; max-height: none; border-top: 1px solid var(--color-border); }
+    .dtw-start { display: flex; flex: 1; align-items: center; justify-content: center; flex-direction: column; gap: 0.75rem; min-height: 17rem; padding: 1rem; border-top: 1px solid var(--color-border); text-align: center; }
     .dtw-start > x-icon { font-size: 2rem; color: var(--color-text-muted); }
     .dtw-start button { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.5rem; }
     .dtw-start button x-icon { font-size: 1.1rem; }

@@ -8,7 +8,7 @@ This plugin adds a terminal button to the chat input area and opens a docked ter
 
 ## Welcome panel
 
-On a welcome screen with movable blocks, Terminal appears as a full-width panel. Click **Open terminal** to connect; visiting Welcome alone does not start a shell. Use the header controls to switch to half width, drag the panel, or dismiss it. **Show all dismissed** restores it. Adjacent half-width panels share a row; an unpaired panel expands automatically.
+On a welcome screen with movable blocks, Terminal appears as a full-width panel. Click **Open terminal** to connect; visiting Welcome alone does not start a shell. Use the header controls to switch to half width, drag the panel, or dismiss it. **Show all dismissed** restores it. Adjacent half-width panels share a row; an unpaired panel expands automatically. The terminal fills its card to the bottom, including when paired with a taller panel.
 
 The welcome panel and chat panel share sessions and terminal controls. Moving the panel or switching between Welcome and chat preserves sessions, including when close-on-hide is enabled. Explicitly hiding the terminal still follows `preserve_sessions_on_hide`. On older Agent Zero versions, the original chat terminal remains available.
 
